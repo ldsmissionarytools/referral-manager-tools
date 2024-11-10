@@ -5,14 +5,7 @@ import json
 from pathlib import Path
 
 with open(Path(__file__).with_name('settings.json')) as f:
-    try:
-        settings = json.load(f)
-    except:
-        settings = dict()
-        settings['username'] = ''
-        settings['password'] = ''
-        settings['sec_email'] = ''
-        settings['mission_id'] = 0
+    settings = json.load(f)
     
 
     username = settings['username']
