@@ -1,6 +1,6 @@
 import requests
 import re
-import datetime
+from datetime import datetime, UTC, timedelta
 from enum import Enum
 import time
 
@@ -31,10 +31,22 @@ class ReferralManager:
         html_resp = self.__session.get(f"{self.__host('www')}/services/platform/v4/login").content.decode("unicode_escape")
         state_token = re.search(r"\"stateToken\":\"([^\"]+)\"", html_resp).groups()[0]
         self.__session.post(f"{self.__host('id')}/idp/idx/introspect", json={"stateToken": state_token})
-        state_handle = self.__session.post(f"{self.__host('id')}/idp/idx/identify", json={"identifier": self.__username, "stateHandle": state_token}).json()["stateHandle"]
-        challenge_resp = self.__session.post(f"{self.__host('id')}/idp/idx/challenge/answer", json={"credentials": {"passcode": self.__password}, "stateHandle": state_handle}).json()
+        username_res = self.__session.post(f"{self.__host('id')}/idp/idx/identify", json={"identifier": self.__username, "stateHandle": state_token}).json()
+        state_handle = username_res["stateHandle"]
+        password_auth_id = [auth_type["id"] for auth_type in username_res["authenticators"]["value"] if auth_type["type"] == "password"][0]
+        authenticators_resp = self.__session.post(f"{self.__host('id')}/idp/idx/challenge", json={
+            "authenticator": {
+                "id": password_auth_id,  # Password authenticator ID
+                "methodType": "password"
+            },
+            "stateHandle": state_handle
+        }).json()
+        state_handle = authenticators_resp["stateHandle"]
+        challenge_resp = self.__session.post(f"{self.__host('id')}/idp/idx/challenge/answer", json={
+            "credentials": {"passcode": self.__password}, 
+            "stateHandle": state_handle
+        }).json()
         self.__session.get(challenge_resp["success"]["href"])
-        test = next(cookie for cookie in self.__session.cookies if cookie.name == 'oauth_id_token').expires
         access_token = self.__session.cookies.get_dict()["oauth_id_token"]
         self.__session.cookies.set("owp", access_token)
     
@@ -44,6 +56,10 @@ class ReferralManager:
             if leader['missionary']['emailAddress'] == email:
                 return leader['missionary']
         return None
+    
+    def get_mission_id(self) -> int:
+        mission_id = self.__session.get(self.__host('referralmanager') + '/services/people/mission').json()['persons'][0]['missionId']
+        return mission_id
     
     def get_mission_info(self) -> dict:
         mission = self.__session.get(self.__host('referralmanager') + f'/services/mission/{self.__mission_id}').json()['mission']
@@ -84,7 +100,7 @@ class ReferralManager:
                 "referral": {
                     "personGuid": None,
                     "referralNote": referral_note, # referal note to be included with the reference
-                    "createDate": int(datetime.datetime.now(datetime.UTC).timestamp() * 1000),
+                    "createDate": int(datetime.now(UTC).timestamp() * 1000),
                     "sentToLocalPersonGuid": self.__media_sec["clientGuid"],
                     "sentToLocalAppId": None,
                     "referralStatus": "UNCONTACTED" # the reference has been uncontacted
@@ -98,7 +114,7 @@ class ReferralManager:
                     "locId": 87, # Brazil location ID
                     "orgId": org_id, # ID of the closest ward or branch
                     "missionaryId": None,
-                    "modDate": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M.%S0Z"), # time of creation,
+                    "modDate": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M.%S0Z"), # time of creation,
                     "people": [
                         {
                             "firstName": first_name, # first name of the reference
@@ -189,10 +205,17 @@ class ReferralManager:
                 household = self.__session.get(self.__host('referralmanager') + '/services/households/' + person['householdGuid']).json()
                 household['people'][0]['prosAreaId'] = designated_area['bestProsAreaId']
                 household['orgId'] = designated_area['bestOrgId']
-                household['modDate'] = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M.%S0Z")
+                household['modDate'] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + 'Z'
                 household['people'][0]['changerId'] = self.__media_sec["cmisId"]
                 household['missionaryId'] = None
                 household['changerId'] = self.__media_sec["cmisId"]
+                household['people'][0]['householdInfo'] = {
+                    "orgId": designated_area['missions'][0]['orgId'],
+                    "orgNum": household['orgNum'],
+                    "stewardCmisId": None,
+                    "address": household['address'],
+                    "locId": household['locId']
+                }
 
                 data = {
                     "payload": {
@@ -200,19 +223,22 @@ class ReferralManager:
                         "referral": {
                             "personGuid": None,
                             "referralNote": None,
-                            "createDate": int(datetime.datetime.now(datetime.UTC).timestamp() * 1000),
+                            "createDate": int(datetime.now(UTC).timestamp() * 1000),
                             "sentToLocalPersonGuid": self.__media_sec["clientGuid"],
                             "sentToLocalAppId": None,
                             "referralStatus": "UNCONTACTED"
                         },
                         "household": household,
-                        "person": household['people'][0],
+                        "person": household['people'][0].copy(),
                         "follow": [self.__media_sec["cmisId"]],
                         "needsPrivacyNotice": False
                     }
                 }
-                status_code = self.__session.post(f"{self.__host("referralmanager")}/services/referrals/sendtolocal", json=data).status_code
-                if status_code != 200: 
+                data['payload']['person'].pop('changerId')
+                res = self.__session.post(f"{self.__host("referralmanager")}/services/referrals/sendtolocal", json=data)
+                status_code = res.status_code
+                if status_code != 200:
+                    print(f'Erro ao designar {person["firstName"]} {person["lastName"]} para a area {designated_area["bestProsAreaId"]}. response: {res.status_code} - {res.reason}')
                     continue
                 print(f'Designou {person['firstName']} com successo!')
             except:
@@ -269,4 +295,7 @@ class ReferralManager:
     
     def stop_teaching_for_far_from_cof(self, guid: int):
         return self.__session.put(self.__host("referralmanager") + f"/services/people/{guid}/drop", json={"status": 28})
+    
+    def get_timeline(self, person_id: str):
+        return self.__session.get(self.__host("referralmanager") + f"/services/progress/timeline/{person_id}").json()
 
