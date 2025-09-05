@@ -3,6 +3,7 @@ import re
 from datetime import datetime, UTC, timedelta
 from enum import Enum
 import time
+from playwright.sync_api import sync_playwright
 
 class ReferenceType(Enum):
     BOOK_OF_MORMON = 23,
@@ -28,33 +29,80 @@ class ReferralManager:
         return f"https://{name}.churchofjesuschrist.org"
     
     def __authenticate(self):
-        html_resp = self.__session.get(f"{self.__host('www')}/services/platform/v4/login").content.decode("unicode_escape")
-        state_token = re.search(r"\"stateToken\":\"([^\"]+)\"", html_resp).groups()[0]
-        self.__session.post(f"{self.__host('id')}/idp/idx/introspect", json={"stateToken": state_token})
-        username_res = self.__session.post(f"{self.__host('id')}/idp/idx/identify", json={"identifier": self.__username, "stateHandle": state_token}).json()
-        state_handle = username_res["stateHandle"]
-        password_auth_id = [auth_type["id"] for auth_type in username_res["authenticators"]["value"] if auth_type["type"] == "password"][0]
-        authenticators_resp = self.__session.post(f"{self.__host('id')}/idp/idx/challenge", json={
-            "authenticator": {
-                "id": password_auth_id,  # Password authenticator ID
-                "methodType": "password"
-            },
-            "stateHandle": state_handle
-        }).json()
-        state_handle = authenticators_resp["stateHandle"]
-        challenge_resp = self.__session.post(f"{self.__host('id')}/idp/idx/challenge/answer", json={
-            "credentials": {"passcode": self.__password}, 
-            "stateHandle": state_handle
-        }).json()
-        self.__session.get(challenge_resp["success"]["href"])
-        access_token = self.__session.cookies.get_dict()["oauth_id_token"]
+        p = sync_playwright().start()
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context()
+        page = ctx.new_page()
+
+        # Go to login page
+        page.goto(f"{self.__host('www')}/services/platform/v4/login",
+                  wait_until="networkidle",
+                  timeout=15000)
+
+        # Fill username and submit
+        page.locator("input:visible").first.fill(self.__username)
+        page.keyboard.press("Enter")
+
+        # Fill password and submit
+        page.locator("input[type='password']:visible").first.fill(self.__password)
+        page.keyboard.press("Enter")
+        page.wait_for_url(f"{self.__host('www')}/**")
+
+        #Warm up and collect cookies from referralmanager
+        all_cookies = []
+
+        page.goto(self.__host("referralmanager"), wait_until="load")
+        page.wait_for_url(self.__host("referralmanager"))
+        all_cookies.extend(ctx.cookies())
+
+        unique_cookies = {(c["name"], c["domain"]): c for c in all_cookies}.values()
+
+        access_token = next(
+            c["value"] for c in unique_cookies if c["name"] == "oauth_id_token"
+        )
+
+        for c in unique_cookies:
+            self.__session.cookies.set(
+                c["name"], c["value"], domain=c["domain"].lstrip(".")
+            )
+
+        # Close Playwright
+        browser.close()
+        p.stop()
+
         self.__session.cookies.set("owp", access_token)
+
+        
+        # html_resp = self.__session.get(f"{self.__host('www')}/services/platform/v4/login").content.decode("unicode_escape")
+        # state_token = re.search(r"\"stateToken\":\"([^\"]+)\"", html_resp).groups()[0]
+        # self.__session.post(f"{self.__host('id')}/idp/idx/introspect")#, json={"stateToken": state_token})
+        # username_res = self.__session.post(f"{self.__host('id')}/idp/idx/identify", json={"identifier": self.__username, "stateHandle": state_token}).json()
+        # state_handle = username_res["stateHandle"]
+        # password_auth_id = [auth_type["id"] for auth_type in username_res["authenticators"]["value"] if auth_type["type"] == "password"][0]
+        # authenticators_resp = self.__session.post(f"{self.__host('id')}/idp/idx/challenge", json={
+        #     "authenticator": {
+        #         "id": password_auth_id,  # Password authenticator ID
+        #         "methodType": "password"
+        #     },
+        #     "stateHandle": state_handle
+        # }).json()
+        # state_handle = authenticators_resp["stateHandle"]
+        # challenge_resp = self.__session.post(f"{self.__host('id')}/idp/idx/challenge/answer", json={
+        #     "credentials": {"passcode": self.__password}, 
+        #     "stateHandle": state_handle
+        # }).json()
+        # self.__session.get(challenge_resp["success"]["href"])
+        # access_token = self.__session.cookies.get_dict()["oauth_id_token"]
+        # self.__session.cookies.set("owp", access_token)
     
     def __get_media_sec_info(self, email: str, mission_id: int) -> dict:
         mission = self.get_mission_info()
-        for leader in mission['leadership']:
-            if leader['missionary']['emailAddress'] == email:
-                return leader['missionary']
+        for zone in mission['children']:
+            for district in zone['children']:
+                for area in district['children']:
+                    for missionary in area['missionaries'] if area['missionaries'] else []:
+                        if missionary['emailAddress'] == email:
+                            return missionary
         return None
     
     def get_mission_id(self) -> int:
@@ -66,7 +114,6 @@ class ReferralManager:
         return mission
     
     def get_area_for_address(self, address: str):
-        
         designated_area = self.__session.get(self.__host('referralmanager') + f'/services/mission/assignment', params={'address': address, 'langCd': 'por'}).json()
         return designated_area
     
@@ -195,6 +242,7 @@ class ReferralManager:
     
     def assign_referrals(self):
         unassigned_people = self.get_unassigned_people()
+        print(f'Tentando designar {len(unassigned_people)} pessoas...')
         for person in unassigned_people:
             try:
                 designated_area = self.get_area_for_address(person['address'])
@@ -248,20 +296,12 @@ class ReferralManager:
         return self.__session.get(self.__host("referralmanager") + f"/services/people/mission/{self.__mission_id}").json()['persons']
 
     def get_unassigned_people(self) -> list:
-        unassigned_people = list()
         people = self.get_all_references()
-        for person in people:
-            if person['areaId'] == None:
-                unassigned_people.append(person)
-        return unassigned_people
+        return [person for person in people if person['areaId'] is None]
     
     def get_recent_converts(self) -> list:
-        recent_converts = list()
         people = self.get_all_references()
-        for person in people:
-            if person['convert'] == True:
-                recent_converts.append(person)
-        return recent_converts
+        return [person for person in people if person['convert'] == True]
     
     def get_person(self, guid: int):
         return self.__session.get(f'{self.__host('referralmanager')}/services/people/{guid}').json()
@@ -270,28 +310,16 @@ class ReferralManager:
         return self.__session.get(f'{self.__host('referralmanager')}/services/households/{guid}').json()
     
     def get_references_by_area_name(self, area_name: str):
-        references_in_area = list()
         references = self.get_all_references()
-        for reference in references:
-            if reference['areaName'] == area_name:
-                references_in_area.append(reference)
-        return references_in_area
+        return [reference for reference in references if reference['areaName'] == area_name]
 
     def get_references_by_district_name(self, district_name: str):
-        references_in_district = list()
         references = self.get_all_references()
-        for reference in references:
-            if reference['districtName'] == district_name:
-                references_in_district.append(reference)
-        return references_in_district
+        return [reference for reference in references if reference['districtName'] == district_name]
 
     def get_references_by_zone_name(self,zone_name: str):
-        references_in_zone = list()
         references = self.get_all_references()
-        for reference in references:
-            if reference['zoneName'] == zone_name:
-                references_in_zone.append(reference)
-        return references_in_zone
+        return [reference for reference in references if reference['zoneName'] == zone_name]
     
     def stop_teaching_for_far_from_cof(self, guid: int):
         return self.__session.put(self.__host("referralmanager") + f"/services/people/{guid}/drop", json={"status": 28})
